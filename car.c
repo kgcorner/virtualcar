@@ -5,22 +5,23 @@
 #include<linux/cdev.h>
 #include<linux/device.h>
 #include<asm/uaccess.h>
+#include<linux/rwsem.h>
 #include<linux/delay.h>
-#include<linux/semaphore.h>
+#include<linux/sched.h>
 #define LF_ON 1
 #define RF_ON 1
 #define LB_ON 1
 #define RB_ON 1
 #define SUCCESS 0
-#define DEVICE_NAME "Virtual_Car"
-#define init_MUTEX(LOCKNAME) sema_init (LOCKNAME, 1);
+#define DEVICE_NAME "Virtual_Car1"
+
 
 
 static dev_t mycar_devno;
 static struct class *myVcarClass;
 static int count=1;
 static struct device *mydev;
-static char *ramdisk;
+char *ramdisk;
 static const int ramspace=(16*PAGE_SIZE);
 static int accelaration=10;
 static int maxspeed=100;
@@ -37,7 +38,7 @@ struct v_car
 	int speed;
 	int accelaration;
 	int maxspeed;	
-	struct semaphore sem;
+	struct rw_semaphore sem;
 };
 
 static struct v_car *vcar;
@@ -91,9 +92,22 @@ static void updateSpeed(void)
 ssize_t vcar_read(struct file *file,char __user *buf,size_t len,loff_t *offset)
 {	
 	int byte_to_read,maxbyte;
-	//msleep(10000);
-	printk(KERN_INFO "[VCAR] Starting reading Car's Status\n");
-	printk(KERN_INFO "[VCAR] len in read function is %d\n",(int)len);
+	struct task_struct *task;
+	task=current;
+	printk(KERN_INFO "[VCAR] %d Starting reading Car's Status\n",task->pid);
+	printk(KERN_INFO "[VCAR] %d len in read function is %d\n",task->pid,(int)len);
+	printk(KERN_INFO "[VCAR]%d Taking read semaphore lock \n",task->pid);
+	if(down_read_trylock(&vcar->sem)){
+		printk(KERN_INFO "[VCAR] Starting ramdisk Allocation\n");
+		ramdisk=kmalloc(ramspace,GFP_KERNEL);
+		if(ramdisk==NULL)
+		{
+			printk(KERN_ALERT "[VCAR] Ramdisk Allocation Failed\n");
+			return -ENOMEM;
+		}
+		printk(KERN_INFO "[VCAR] Ramdisk Allocated\n");
+		printk(KERN_INFO "[VCAR] %d Read lock taken successfully by process \n",task->pid);
+		//msleep(3000);
 	sprintf(ramdisk,"Current Status of Virtual Car \n\
 		Direction:%s\n\
 		Speed:%d\n\
@@ -104,26 +118,28 @@ ssize_t vcar_read(struct file *file,char __user *buf,size_t len,loff_t *offset)
 	byte_to_read=maxbyte>len?len:maxbyte;
 	if(byte_to_read==0)
 	{
-		printk(KERN_INFO"[VCAR] Reached End of message\n");
+		printk(KERN_INFO"[VCAR] %d Reached End of message\n",task->pid);
+		up_read(&vcar->sem);
+		printk(KERN_INFO "[VCAR] %d Read lock released successfully\n",task->pid);
 		return 0;
 	}
 	if(copy_to_user(buf,ramdisk+*offset,byte_to_read))
 	{
+		up_read(&vcar->sem);
+		printk(KERN_INFO "[VCAR] %d Read lock released successfully\n",task->pid);
 		return -EFAULT;
 	}
-	//byte_to_read=0;
-	/*if(len && *ramdisk)
-	{
-		printk(KERN_INFO "[VCAR] Loop Started\n");
-		put_user(*(ramdisk++),buf++);
-		byte_to_read++;
-		len--;
-	}*/
 	*offset+=byte_to_read;
-	printk(KERN_INFO "[VCAR] Car's Status Copied to userspace\n");
-	printk(KERN_INFO"[VCAR] Ramdisk is holding info as All read Byte=%d\n",byte_to_read);
-	printk(KERN_INFO "[VCAR] Releasing semaphore\n");
-	up(&vcar->sem);
+	printk(KERN_INFO "[VCAR] %d Car's Status Copied to userspace\n",task->pid);
+	printk(KERN_INFO"[VCAR] %d Ramdisk is holding info as All read Byte=%d\n",task->pid,byte_to_read);
+	up_read(&vcar->sem);
+	printk(KERN_INFO "[VCAR] %d Read lock released successfully\n",task->pid);
+	}
+	else
+	{
+		printk(KERN_INFO "[VCAR] %d semaphore lock has been taken by another process \n",task->pid);
+		return -ERESTARTSYS;
+	}
 	return byte_to_read;
 }
 ssize_t vcar_write(struct file *file,const char __user *buf,size_t len,loff_t *offset)
@@ -131,9 +147,15 @@ ssize_t vcar_write(struct file *file,const char __user *buf,size_t len,loff_t *o
 
 	printk(KERN_INFO "[VCAR] Write Operation INitiated\n");
 	printk(KERN_INFO "[VCAR] len in write function is %d\n",(int)len);
+	printk(KERN_INFO "[VCAR] Taking Write semaphore lock\n");
+	if(down_write_trylock(&vcar->sem)){
+		printk(KERN_INFO "[VCAR] Write semaphore lock taken successfully\n");
+		msleep(3000);
 	if(buf==NULL)
 	{
 		printk(KERN_INFO "[VCAR] Nothing Found to write\n");
+		up_write(&vcar->sem);
+		printk(KERN_INFO "[VCAR] Write semaphore lock released successfully\n");
 		return 0;
 	}
 	else
@@ -142,7 +164,6 @@ ssize_t vcar_write(struct file *file,const char __user *buf,size_t len,loff_t *o
 		{
 			case 'a':
 				vcar->accelaration=getVal(buf,3,len);
-				
 				if(prev_command == 'a')
 				{
 					op_count++;
@@ -226,38 +247,26 @@ ssize_t vcar_write(struct file *file,const char __user *buf,size_t len,loff_t *o
 		printk(KERN_INFO "[VCAR] Input scanned \n");
 		printk(KERN_INFO "[VCAR] Updating Car's Status\n");
 	}
-	printk(KERN_INFO "[VCAR] Releasing semaphore\n");
-	up(&vcar->sem);
+	up_write(&vcar->sem);
+	printk(KERN_INFO "[VCAR] Write semaphore lock released successfully\n");
+	}
+	else
+	{
+		printk(KERN_INFO "[VCAR] Another process hold write semaphore lock\n");
+		return -ERESTARTSYS;
+	}
 	return len;
 }
 
 int vcar_open(struct inode *inode,struct file *file)
 {
-	printk(KERN_INFO "[VCAR] Starting ramdisk Allocation\n");
-	printk(KERN_INFO "[VCAR] Taking Semaphore\n");
-	if(!down_trylock(&vcar->sem))
-	{
-		printk(KERN_INFO "[VCAR] Lock hold on Semaphore\n");
-		ramdisk=kmalloc(ramspace,GFP_KERNEL);
-		if(ramdisk==NULL)
-		{
-			printk(KERN_ALERT "[VCAR] Ramdisk Allocation Failed\n");
-			return -ENOMEM;
-		}
-		printk(KERN_INFO "[VCAR] Ramdisk Allocated\n");
-	}
-	else
-	{
-		printk(KERN_ALERT "[VCAR] Semaphore hold by another process\n");
-		return - ERESTARTSYS;
-	}
+	
 	printk(KERN_INFO "[VCAR] Opening File\n");	
 	return SUCCESS;
 }
 int vcar_release(struct inode *inode,struct file *file)
 {
-	printk(KERN_INFO "[VCAR] Releasing Ramdisk\n");
-	
+	printk(KERN_INFO "[VCAR]%d Releasing Ramdisk\n",current->pid);
 	kfree(ramdisk);
 	return SUCCESS;
 }
@@ -295,14 +304,13 @@ int init_module()
 		vcar->dev=kzalloc(sizeof(struct cdev),GFP_KERNEL);
 		cdev_init(vcar->dev,&file_op);
 		printk(KERN_INFO "[VCAR] Char Device initialised\n");
-		printk(KERN_INFO "[VCAR] Initializing Semaphore\n");
-		init_MUTEX(&vcar->sem);
-		printk(KERN_INFO "[VCAR] Semaphore initialised\n");
+		init_rwsem(&vcar->sem);
 		if(cdev_add(vcar->dev,mycar_devno,count))
 		{
 			unregister_chrdev_region(mycar_devno,count);
 			printk(KERN_ALERT "[VCAR]char_add() failed\n");
-			return -1;}
+			return -1;
+		}
 		myVcarClass=class_create(THIS_MODULE,"Virtual_Car");
 		mydev=device_create(myVcarClass,NULL,mycar_devno,NULL,"%s",DEVICE_NAME);
 		printk(KERN_INFO "[VCAR] Device created with n	ame %s\n",DEVICE_NAME);
